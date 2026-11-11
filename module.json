@@ -1,0 +1,61 @@
+{
+    "name": "outbox",
+    "version": "0.1.0",
+    "kernel": "^1.19.0",
+    "solves": "event.outbox",
+    "type": "module",
+
+    "requires": [],
+
+    "exposes": [
+        "Plugins\\Outbox\\API\\Contracts\\OutboxContract"
+    ],
+
+    "routes": [],
+    "emits": [],
+    "listens": [],
+    "files": [],
+
+    "documentation": "A shared transactional outbox any plugin can write to. An integration event is written as a row inside the SAME transaction as the state change it describes, and `outbox:relay` delivers it to the EventBus afterwards — so the event and the state change commit or roll back together, because they are the same commit. Delivery is at-least-once and consumers dedupe on the returned event id. There is no ordering guarantee.",
+
+    "//the-one-way-it-silently-breaks": "\"The same transaction\" means THE SAME CONNECTION. The Database plugin binds DatabasePort as a TRANSIENT, so every make() is a new PDO handle: a caller whose transaction runs on connection A and an outbox that resolved connection B produce a row that is not in the transaction at all — delivered after a rollback, or visible before the commit. Nothing about it looks wrong, and it works under the kernel's own withPorts() path (which shares via instance()) while breaking under the per-request rebinding tenancy needs. OutboxContract::on() lets a caller hand over its exact connection, and write() REFUSES when its own connection has no open transaction — which is what the second case looks like from here.",
+
+    "//claiming": "Relays claim rows one at a time with `UPDATE ... WHERE id = :id AND status = 0`, and treat an affected-row count of 0 as a lost race. That is why concurrent relays do not double-deliver, and why this is NOT `SELECT ... FOR UPDATE`: that lock lives only inside a transaction, so the transaction would have to stay open across the dispatch — holding a row lock while a listener calls someone else's HTTP endpoint. A claim is a committed lease instead, released by the reclaim scan if the relay dies.",
+
+    "//commands-are-instances": "Provider::boot() registers the four commands as INSTANCES, not class-strings. A class-string is built from the CoreContainer, and when that fails the command is silently not registered at all — it does not appear in `list`. Every command here takes OutboxContract, an interface bound per request, which cannot be autowired from the core container. They stay declared below for discovery; DeclaredCommands skips any class whose constructor takes parameters, so there is no double registration.",
+
+    "//no-wildcard-subscription": "This plugin deliberately does NOT subscribe to EventBus::ALL to capture dispatches. A wildcard listener fires at dispatch time, which is AFTER the commit — that is an event journal, not an outbox, and it carries none of the atomicity this exists for. Events arrive here only through an explicit write() inside a transaction.",
+
+    "commands": [
+        "Plugins\\Outbox\\Infrastructure\\Cli\\OutboxRelayCommand",
+        "Plugins\\Outbox\\Infrastructure\\Cli\\OutboxStatusCommand",
+        "Plugins\\Outbox\\Infrastructure\\Cli\\OutboxRetryCommand",
+        "Plugins\\Outbox\\Infrastructure\\Cli\\OutboxPruneCommand"
+    ],
+
+    "//schedule": "The relay is declared here so a deployment is not one forgotten cron line away from an outbox that fills up and delivers nothing. withOverlapping is off: two relays are SAFE (they claim rows), but a minute-by-minute schedule stacking up behind one slow listener is still pointless work. expiresAfter is short because the lock must not outlive the gap to the next tick by much, or a relay killed mid-run blocks the schedule.",
+
+    "schedule": [
+        {
+            "name": "outbox.relay",
+            "at": "* * * * *",
+            "command": "outbox:relay --quiet-when-idle",
+            "withoutOverlapping": true,
+            "expiresAfter": 120
+        },
+        {
+            "name": "outbox.prune",
+            "at": "17 4 * * *",
+            "command": "outbox:prune --yes",
+            "withoutOverlapping": true,
+            "expiresAfter": 3600
+        }
+    ],
+
+    "config": [
+        { "key": "OUTBOX_MAX_ATTEMPTS", "type": "int", "required": false, "default": 10 },
+        { "key": "OUTBOX_RELAY_LIMIT", "type": "int", "required": false, "default": 100 },
+        { "key": "OUTBOX_CLAIM_TIMEOUT", "type": "int", "required": false, "default": 300 },
+        { "key": "OUTBOX_PRUNE_AFTER_DAYS", "type": "int", "required": false, "default": 7 }
+    ]
+}
